@@ -1,0 +1,50 @@
+#!/bin/bash
+# -*- coding: utf-8 -*-
+# vim: set fileencoding=utf-8
+# Copyright (c) 2017 Julien Seiler (IGBMC),
+# 2017 Julien Seiler <seilerj@igbmc.fr>,
+#
+# This will submit a batch script that starts jupyter-notebook on a node.
+
+MYDIR="$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"
+
+# Batch Script that starts jupyter-notebook
+BS=$MYDIR/sjupyter.sbatch
+
+# Submit the job and get the job id
+mkdir -p $HOME/.sjupyter
+JOB=$(sbatch $@ --output=$HOME/.sjupyter/%j.out --error=$HOME/.sjupyter/%j.out $BS \
+    | grep -E --line-buffered -o -e "\b[0-9]+$")
+sbatch_status=$?
+if [ $sbatch_status -ne 0 ];then
+    exit $sbatch_status
+fi
+
+# Make sure the job is always canceled
+trap '{ scancel $JOB; rm $HOME/.sjupyter/$JOB.out; exit; }' INT
+
+echo "Waiting for the jupyter notebook slurm job to start"
+while true;do
+    sleep 1s
+
+    # Check job status
+    STATUS=$(squeue -j $JOB -t PD,R -h -o %t)
+
+    if [ "$STATUS" = "R" ];then
+	# Job is running, break the while loop
+	break
+    elif [ "$STATUS" != "PD" ];then
+	echo "Job is not Running or Pending. Aborting"
+	scancel $JOB
+	exit 1
+    fi
+
+    echo -n "."
+
+done
+
+echo "Jupyter notebook is starting... (please wait)"
+sleep 10s
+tail -f $HOME/.sjupyter/$JOB.out
+
+scancel $JOB
