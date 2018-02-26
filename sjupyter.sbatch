@@ -11,6 +11,6 @@ jip=$(ip route | tail -1 | awk -F 'link src ' '{print $2}')
 if [ "$JUPYTER_PATH" == "" ]
 then
   module load jupyter
-  JUPYTHER_PATH=sjupyter-notebook
+  JUPYTER_PATH=sjupyter-notebook
 fi
 $JUPYTER_PATH --no-browser --notebook-dir=/shared --port=$jport --ip=$jip
