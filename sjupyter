@@ -10,6 +10,20 @@ MYDIR="$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"
 
 # Batch Script that starts jupyter-notebook
 BS=$MYDIR/sjupyter.sbatch
+JUPYTER_PATH=
+
+while [ "$1" != "" ]; do
+  PARAM=`echo $1 | awk -F= '{print $1}'`
+  VALUE=`echo $1 | sed 's/^[^=]*=//g'`
+  case $PARAM in
+    --jupyter)
+      JUPYTER_PATH=$VALUE
+      ;;
+  esac
+  shift
+done
+
+export JUPYTER_PATH
 
 # Submit the job and get the job id
 mkdir -p $HOME/.sjupyter
@@ -48,3 +62,4 @@ sleep 10s
 tail -f $HOME/.sjupyter/$JOB.out
 
 scancel $JOB
+export JUPYTER_PATH=

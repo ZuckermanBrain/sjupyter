@@ -8,5 +8,9 @@ XDG_RUNTIME_DIR=""
 jport=$(shuf -i8000-9999 -n1)
 jip=$(ip route | tail -1 | awk -F 'link src ' '{print $2}')
 
-module load jupyter
-jupyter-notebook --no-browser --notebook-dir=/shared --port=$jport --ip=$jip
+if [ "$JUPYTER_PATH" == "" ]
+then
+  module load jupyter
+  JUPYTHER_PATH=sjupyter-notebook
+fi
+$JUPYTER_PATH --no-browser --notebook-dir=/shared --port=$jport --ip=$jip
