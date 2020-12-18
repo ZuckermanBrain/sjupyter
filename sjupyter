@@ -2,64 +2,214 @@
 # -*- coding: utf-8 -*-
 # vim: set fileencoding=utf-8
 # Copyright (c) 2017 Julien Seiler (IGBMC),
-# 2017 Julien Seiler <seilerj@igbmc.fr>,
+# Original: 2017 Julien Seiler <seilerj@igbmc.fr>,
+#
+# Copyright (c) 2020 The Trustees of Columbia University in the City of New York.
+# All rights reserved.
+# Revisions: 2020 John Pellman <jsp2205@columbia.edu>
 #
 # This will submit a batch script that starts jupyter-notebook on a node.
 
-MYDIR="$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"
+# If JUPYTER_PATH is unset, set it to the value of jupyter-notebook already on path.
+if [ -z ${JUPYTER_PATH} ];
+then
+	JUPYTER_UNSET=1
+	export JUPYTER_PATH=$(which jupyter-notebook 2> /dev/null)
+	# In case jupyter-notebook is not found on path
+	if [ -z ${JUPYTER_PATH} ];
+	then
+		echo "jupyter-notebook not found; make sure you activate your environment first or the anaconda module"
+		exit 1
+	fi
+else
+	JUPYTER_UNSET=0
+fi
 
-# Batch Script that starts jupyter-notebook
-BS=$MYDIR/sjupyter.sbatch
-JUPYTER_PATH=
+export SJUPYTER_USER_DIR=${HOME}/.sjupyter
 
-while [ "$1" != "" ]; do
-  PARAM=`echo $1 | awk -F= '{print $1}'`
-  VALUE=`echo $1 | sed 's/^[^=]*=//g'`
-  case $PARAM in
-    --jupyter)
-      JUPYTER_PATH=$VALUE
-      ;;
-  esac
-  shift
+# Directory for sjupyter files
+if [ ! -d ${SJUPYTER_USER_DIR} ]; then
+	mkdir -p ${SJUPYTER_USER_DIR}
+fi
+
+# Set default output/error file(s) for sjupyter job to live in temp directory
+# if --output and --error are not specified.
+# Add --parsable to command if not specified.
+EXTRA_ARGS=""
+SJUPYTER_OUTPUT=""
+SJUPYTER_ERROR=""
+SJUPYTER_OUTPUT_UPDATE=""
+SJUPYTER_ERROR_UPDATE=""
+SJUPYTER_PARSABLE=""
+SJUPYTER_GET_NOTEBOOK_URL=""
+
+# Override, sanity-check, or provide defaults for  parameters passed 
+# to sbatch.  Add custom params.
+for PARAM in ${@};
+do
+	if [[ ${PARAM} =~ "--output=" ]]; then
+		SJUPYTER_OUTPUT=$(echo ${PARAM} | cut -d= -f2)
+	fi
+	if [[ ${PARAM} =~ "--error=" ]]; then
+		SJUPYTER_ERROR=$(echo ${PARAM} | cut -d= -f2)
+	fi
+	if [[ ${PARAM} =~ "--parsable" ]]; then
+		SJUPYTER_PARSABLE=1
+	fi
+	# Custom option to get the notebook URL for an already running job.
+	if [[ ${PARAM} =~ "--get-notebook-url=" ]]; then
+		SJUPYTER_JOBID=$(echo ${PARAM} | cut -d= -f2)
+		SJUPYTER_GET_NOTEBOOK_URL=1
+	fi
 done
 
-export JUPYTER_PATH
+if [ ! -z ${SJUPYTER_GET_NOTEBOOK_URL} ]; then
+	if [ -z ${SJUPYTER_OUTPUT} ]; then
+		SJUPYTER_OUTPUT="${SJUPYTER_USER_DIR}/jobs/${SJUPYTER_JOBID}.out"
+	fi
+	if [ -f ${SJUPYTER_OUTPUT} ]; then
+		grep -A 4 -e "To access the notebook" -e "Copy/paste this URL into your browser when you connect for the first time" ${SJUPYTER_OUTPUT}
+		exit 0
+	else
+		echo "Unable to determine URL of notebook."
+		exit 1
+	fi
+fi
 
-# Submit the job and get the job id
-mkdir -p $HOME/.sjupyter
-JOB=$(sbatch $@ --output=$HOME/.sjupyter/%j.out --error=$HOME/.sjupyter/%j.out $BS \
-    | grep -E --line-buffered -o -e "\b[0-9]+$")
-sbatch_status=$?
-if [ $sbatch_status -ne 0 ];then
-    exit $sbatch_status
+# Temp directory to hold job id 
+export SJUPYTER_TMPFILE=$(mktemp -p ${SJUPYTER_USER_DIR})
+
+# Directory for default location of job stdout/stderr
+# We put job stdout/stderr here so that things get cleaned up 
+# neatly when the job is cancelled (i.e., no NFS handlers hanging out
+# in a directory we can't remove).
+if [ ! -d ${SJUPYTER_USER_DIR}/jobs ]; then
+	mkdir -p ${SJUPYTER_USER_DIR}/jobs
+fi
+
+if [ -z ${SJUPYTER_OUTPUT} ]; then
+	SJUPYTER_OUTPUT="${SJUPYTER_USER_DIR}/jobs/%j.out"
+	SJUPYTER_OUTPUT_UPDATE=1
+	EXTRA_ARGS="${EXTRA_ARGS} --output=${SJUPYTER_OUTPUT}"
+fi
+if [ -z ${SJUPYTER_ERROR} ]; then
+	SJUPYTER_ERROR="${SJUPYTER_USER_DIR}/jobs/%j.out"
+	SJUPYTER_ERROR_UPDATE=1
+	EXTRA_ARGS="${EXTRA_ARGS} --error=${SJUPYTER_ERROR}"
+fi
+if [ -z ${SJUPYTER_PARSABLE} ]; then
+	EXTRA_ARGS="${EXTRA_ARGS} --parsable"
+fi
+
+# Submit batch script
+sbatch ${@} ${EXTRA_ARGS} << 'EOF' > ${SJUPYTER_TMPFILE} || exit $?
+#!/bin/bash
+#SBATCH --job-name jupyter
+#SBATCH --no-requeue
+
+XDG_RUNTIME_DIR=""
+IP=$(hostname -i)
+# Choose an open port between 8000 and 9999
+# Start by assuming that the port is closed unless proven otherwise by lsof.
+# Essentially, busy wait until a port within the range is free.
+PORT_CLOSED=1
+while [ ${PORT_CLOSED} -eq 1 ]; do
+	PORT=$(shuf -i8000-9999 -n1)
+	if ! lsof -i:${PORT}; then
+		PORT_CLOSED=0
+	fi
+	sleep 1
+done
+
+trap "{ if [ -f ${SJUPYTER_USER_DIR}/jobs/${SLURM_JOB_ID}.out ]; then rm ${SJUPYTER_USER_DIR}/jobs/${SLURM_JOB_ID}.out; fi; exit; }" EXIT
+
+${JUPYTER_PATH} --no-browser --port=${PORT} --ip=${IP}
+EOF
+# Use cut because sometimes --parsable will also output cluster name, with colon as delimiter
+# between jobid and cluster.
+SJUPYTER_JOBID=$(cut -d: -f1 ${SJUPYTER_TMPFILE})
+# We only needed the temp file to store the job id.
+rm ${SJUPYTER_TMPFILE}
+
+# Convert template to use actual job ID.
+if [ ! -z ${SJUPYTER_OUTPUT_UPDATE} ]; then
+	SJUPYTER_OUTPUT="${SJUPYTER_USER_DIR}/jobs/${SJUPYTER_JOBID}.out"
+fi
+if [ ! -z ${SJUPYTER_ERROR_UPDATE} ]; then
+	SJUPYTER_ERROR="${SJUPYTER_USER_DIR}/jobs/${SJUPYTER_JOBID}.out"
 fi
 
 # Make sure the job is always canceled
-trap '{ scancel $JOB; rm $HOME/.sjupyter/$JOB.out; exit; }' INT
+trap "{ scancel ${SJUPYTER_JOBID}; if [ -f ${SJUPYTER_TMPFILE} ]; then rm ${SJUPYTER_TMPFILE}; fi; if [ ! -z ${SJUPYTER_OUTPUT_UPDATE} ] && [ -f ${SJUPYTER_OUTPUT} ] ; then rm ${SJUPYTER_OUTPUT}; fi; if [ ! -z ${SJUPYTER_ERROR_UPDATE} ] && [ -f ${SJUPYTER_ERROR} ] ; then rm ${SJUPYTER_ERROR}; fi; exit;}" INT
 
-echo "Waiting for the jupyter notebook slurm job to start"
-while true;do
-    sleep 1s
+# Set a default timeout if it doesn't start after n iterations of the while loop
+if [ -z ${SJUPYTER_TIMEOUT} ];
+then
+	SJUPYTER_TIMEOUT=120
+fi
 
-    # Check job status
-    STATUS=$(squeue -j $JOB -t PD,R -h -o %t)
-
-    if [ "$STATUS" = "R" ];then
-	# Job is running, break the while loop
-	break
-    elif [ "$STATUS" != "PD" ];then
-	echo "Job is not Running or Pending. Aborting"
-	scancel $JOB
+SJUPYTER_ITERATIONS=0
+echo "Waiting for the Jupyter Notebook SLURM job to start..."
+while [ "$(squeue -j ${SJUPYTER_JOBID} -h -o %t)" != "R" ]; do
+    SJUPYTER_ITERATIONS=$(( SJUPYTER_ITERATIONS + 1 ))
+    if [ "${SJUPYTER_ITERATIONS}" -eq "${SJUPYTER_TIMEOUT}" ]; then
+	echo 
+        echo Timeout reached.  Current timeout value is ${SJUPYTER_TIMEOUT}.
+	echo To deactivate timeout, run \''export SJUPYTER_TIMEOUT=0'\'
+	echo Quitting now.
+	scancel ${SJUPYTER_JOBID}
 	exit 1
     fi
-
-    echo -n "."
-
+    sleep 1
+    echo -n "." 
 done
+echo
 
-echo "Jupyter notebook is starting... (please wait)"
-sleep 10s
-tail -f $HOME/.sjupyter/$JOB.out
+# To avoid case where job is running but output/error files have not been created yet.
+sleep 5
 
-scancel $JOB
-export JUPYTER_PATH=
+echo "Jupyter Notebook is starting..."
+SJUPYTER_ITERATIONS=0
+while ! grep -q -e "To access the notebook" -e "Copy/paste this URL into your browser when you connect for the first time" ${SJUPYTER_OUTPUT} ${SJUPYTER_ERROR} 2> /dev/null; do
+    # Errors of "file not found" occasionally come out of grep.  Deal with those here.
+    if [ ! -f ${SJUPYTER_OUTPUT} ] || [ ! -f ${SJUPYTER_ERROR} ] || [ "$(squeue -j ${SJUPYTER_JOBID} -h -o %t)" != "R" ]; then
+	echo 
+	echo Error: Jupyter Notebook SLURM job is no longer running or has otherwise experienced an error.
+	echo '-----------------------------------------'
+	echo Debugging info:
+	if [ ! -f ${SJUPYTER_OUTPUT} ]; then
+			echo "Output file does not exist."
+	fi
+	if [ ! -f ${SJUPYTER_ERROR} ]; then
+			echo "Error file does not exist."
+	fi
+	scontrol show job ${SJUPYTER_JOBID}
+	echo '-----------------------------------------'
+	echo "To try again, run \"${0} ${@}\""
+	echo Quitting now.
+	scancel ${SJUPYTER_JOBID}
+	exit 1
+    fi
+    SJUPYTER_ITERATIONS=$(( SJUPYTER_ITERATIONS + 1 ))
+    if [ "${SJUPYTER_ITERATIONS}" -eq "${SJUPYTER_TIMEOUT}" ]; then
+	echo 
+        echo Timeout reached.  Current timeout value is ${SJUPYTER_TIMEOUT}	
+	echo To deactivate timeout, run \"export SJUPYTER_TIMEOUT=0\"
+	echo Quitting now.
+	scancel ${SJUPYTER_JOBID}
+	exit 1
+    fi
+    sleep 1
+    echo -n "." 
+done
+echo
+
+echo "Jupyter Notebook has started"
+grep -A 4 -e "To access the notebook" -e "Copy/paste this URL into your browser when you connect for the first time" ${SJUPYTER_OUTPUT} || grep -A 4 -e "To access the notebook" -e "Copy/paste this URL into your browser when you connect for the first time" ${SJUPYTER_ERROR}
+echo "To turn off Jupyter notebook, run \"scancel ${SJUPYTER_JOBID}\"."
+echo "To reprint the URL for the Jupyter notebook, run \"${0} --get-notebook-url=${SJUPYTER_JOBID}\"."
+
+if [ ${JUPYTER_UNSET} -eq 1 ]; then
+	unset JUPYTER_PATH
+fi
+unset SJUPYTER_TMPFILE
