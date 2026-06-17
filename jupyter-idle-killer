@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+jupyter-idle-killer: Smart idle detection 
+"""
+
+import json, os, time, subprocess, sys, logging
+import urllib.error
+from urllib.request import urlopen, Request
+from datetime import datetime, timezone
+
+# Main settings
+IDLE_LIMIT          = int(os.environ.get("IDLE_TIMEOUT", "3600"))          # 1 hour default
+POLL_INTERVAL       = int(os.environ.get("IDLE_POLL_INTERVAL", "60"))
+HEARTBEAT_WINDOW = int(os.environ.get("IDLE_HEARTBEAT_WINDOW", "120"))
+JOBID               = os.environ.get("SLURM_JOB_ID")
+JUPYTER_PORT        = os.environ.get("JUPYTER_PORT")
+LOGFILE = os.path.join(os.path.expanduser("~"), ".sjupyter", "jobs", f"{JOBID}.out") if JOBID else None
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [idle-killer] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger(__name__)
+
+
+def get_servers():
+    # Try modern commands first (Jupyter Server v2) with explicit arguments
+    candidates = [
+        ("jupyter-lab", ["server", "list"]),
+        ("jupyter-server", ["list"]),
+        ("jupyter", ["server", "list"]),
+        ("jupyter-notebook", ["server", "list"]),
+    ]
+
+    for cmd, subcmd in candidates:
+        try:
+            out = subprocess.check_output(
+                [cmd] + subcmd + ["--json"], 
+                stderr=subprocess.DEVNULL
+            ).decode()
+            
+            servers = [json.loads(line) for line in out.splitlines() if line.strip()]
+            if JUPYTER_PORT:
+                servers = [s for s in servers if f":{JUPYTER_PORT}/" in s.get("url", "")]
+            if servers:
+                return servers
+        except Exception:
+            continue
+    return []
+def api_get(url, token):
+    try:
+        req = Request(url, headers={"Authorization": f"token {token}"})
+        with urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e: # Use the full path
+        if e.code == 404:
+            return None
+        raise
+    except Exception: # Broad catch for other network blips
+        return None
+from datetime import datetime, timezone 
+
+def parse_iso(s):
+    if not s:
+        return None
+    s = s.rstrip("Z").split(".")[0]
+    try:
+        dt = datetime.fromisoformat(s)
+        # FIX: Changed datetime.timezone.utc to timezone.utc
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+def kill_job():
+    log.info("Idle limit (%ds) reached — cancelling SLURM job %s", IDLE_LIMIT, JOBID)
+    if JOBID:
+        subprocess.call(["scancel", JOBID])
+
+import os
+import time
+
+def recent_log_activity(window):
+    """
+    Safely ignores network tunnel keep-alives by tracking actual 
+    Jupyter runtime file modifications.
+    """
+    try:
+        runtime_dir = os.path.expanduser("~/.local/share/jupyter/runtime")
+        if not os.path.exists(runtime_dir):
+            return False
+
+        now = time.time()
+        
+        for filename in os.listdir(runtime_dir):
+            if filename.startswith("jpserver-") or filename.startswith("kernel-"):
+                filepath = os.path.join(runtime_dir, filename)
+                mtime = os.path.getmtime(filepath)
+                
+                # If a file was touched within the window (e.g. 60s), user is here
+                if (now - mtime) < window:
+                    return True
+                    
+        return False
+    except Exception:
+        return False
+def main():
+    log.info(f"Started | Timeout={IDLE_LIMIT}s")
+    last_active = time.time()
+    while True:
+        servers = get_servers()
+        activity_reason = None
+        for s in servers:
+            base = s["url"].rstrip("/")
+            token = s["token"]
+            # === Kernels ===
+            kernels = api_get(f"{base}/api/kernels", token) or []
+            for k in kernels:
+                state = k.get("execution_state")
+                ts = parse_iso(k.get("last_activity"))
+                k_id = k.get('id', 'unknown')[:8]
+                if state == "busy":
+                    activity_reason = f"kernel [{k_id}] is busy running code"
+                    break
+                if ts and (time.time() - ts) < POLL_INTERVAL:
+                    activity_reason = f"kernel [{k_id}] execution timestamp updated"
+                    break
+            if activity_reason:
+                break
+            # === Terminals ===
+            terminals = api_get(f"{base}/api/terminals", token) or []
+            if terminals:
+                activity_reason = f"{len(terminals)} terminal(s) open"
+                break
+        # === Browser/log activity fallback ===
+        if not activity_reason and recent_log_activity(HEARTBEAT_WINDOW):
+            activity_reason = "recent browser activity detected"
+        if activity_reason:
+            idle_before_reset = time.time() - last_active
+            if idle_before_reset > POLL_INTERVAL:
+                log.info(f"Activity detected: {activity_reason}. Resetting idle timer.")
+            last_active = time.time()
+        idle_for = time.time() - last_active
+        log.info("Idle for %.0fs / %ds (Remaining: %.0fs)", idle_for, IDLE_LIMIT, IDLE_LIMIT - idle_for)
+        if idle_for > IDLE_LIMIT:
+            kill_job()
+            sys.exit(0)
+        time.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    main()
